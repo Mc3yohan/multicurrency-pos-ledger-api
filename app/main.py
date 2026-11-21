@@ -4,9 +4,10 @@
 from __future__ import annotations
 
 import os
+from contextlib import asynccontextmanager
 from decimal import Decimal
 from pathlib import Path
-from typing import List, Optional
+from typing import AsyncIterator, List, Optional
 
 from fastapi import FastAPI, Header, HTTPException
 
@@ -23,6 +24,7 @@ from app.models import (
     SaleItemIn,
     UserRole,
     money,
+    validate_exchange_rate,
 )
 from app.store import LedgerStore
 
@@ -49,6 +51,7 @@ __all__ = [
     "SaleItemIn",
     "UserRole",
     "money",
+    "validate_exchange_rate",
 ]
 
 
@@ -79,13 +82,19 @@ def create_app(
     if seed_demo and not ledger.list_products():
         ledger.upsert_csv_catalog(DEFAULT_DEMO_CATALOG_CSV)
 
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        yield
+        ledger.close()
+
     api = FastAPI(
         title="Multi-Currency POS Ledger API",
-        version="1.1.0",
+        version="1.2.0",
         description=(
             "FastAPI multi-currency POS engine with atomic SQLite WAL transactions, "
             "Decimal money arithmetic, API-key RBAC margin isolation, and idempotent CSV import."
         ),
+        lifespan=lifespan,
     )
     api.state.store = ledger
     api.state.auth = auth
@@ -161,8 +170,12 @@ def create_app(
         x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
     ) -> CustomerCreditOut:
         auth.resolve_role(x_api_key)
-        bal = ledger.get_customer_credit(customer_ref)
-        return CustomerCreditOut(customer_ref=customer_ref, credit_balance_usd=str(bal))
+        cleaned = customer_ref.strip()
+        try:
+            bal = ledger.get_customer_credit(cleaned)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return CustomerCreditOut(customer_ref=cleaned, credit_balance_usd=str(bal))
 
     return api
 

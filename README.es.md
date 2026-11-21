@@ -40,7 +40,7 @@ Dockerfile
 ### Local (Python 3.11+)
 ```bash
 pip install -r requirements.txt
-pytest -v
+PYTHONPATH=. pytest -v
 
 POS_DB_PATH=./data/ledger.db POS_OWNER_API_KEY=clave-dueno POS_SELLER_API_KEY=clave-vendedor \
   uvicorn app.main:app --reload
@@ -53,6 +53,15 @@ docker run --rm -p 8000:8000 \
   -e POS_OWNER_API_KEY=clave-dueno \
   -e POS_SELLER_API_KEY=clave-vendedor \
   multicurrency-pos-ledger
+```
+
+### Ejemplos de Llamadas API
+```bash
+# Catálogo público/vendedor (sin costos ni márgenes)
+curl -s http://127.0.0.1:8000/catalog
+
+# Vista de márgenes del dueño (401 sin clave, 403 con clave de vendedor)
+curl -s http://127.0.0.1:8000/admin/margins -H "X-API-Key: demo-owner-key"
 ```
 
 ---

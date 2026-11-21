@@ -10,11 +10,11 @@ import sqlite3
 import threading
 from collections import defaultdict
 from datetime import datetime, timezone
-from decimal import Decimal
+from decimal import Decimal, ROUND_DOWN
 from pathlib import Path
 from typing import Dict, List
 
-from app.models import CheckoutIn, PaymentMethod, ProductRecord, money
+from app.models import CheckoutIn, PaymentMethod, ProductRecord, money, validate_exchange_rate
 
 
 def _utc_now_iso() -> str:
@@ -29,7 +29,7 @@ class LedgerStore:
         exchange_rate_ves: Decimal = Decimal("45.50"),
         db_path: str | Path = ":memory:",
     ) -> None:
-        self.exchange_rate_ves = money(exchange_rate_ves)
+        self.exchange_rate_ves = validate_exchange_rate(exchange_rate_ves)
         self.db_path = str(db_path)
         self._lock = threading.RLock()
         if self.db_path != ":memory:":
@@ -42,8 +42,8 @@ class LedgerStore:
     def _init_schema(self) -> None:
         with self._lock:
             if self.db_path != ":memory:":
-                self._conn.execute("PRAGMA journal_mode=WAL;")
                 self._conn.execute("PRAGMA busy_timeout=5000;")
+                self._conn.execute("PRAGMA journal_mode=WAL;")
             self._conn.execute("PRAGMA foreign_keys=ON;")
             self._conn.executescript(
                 """
@@ -103,10 +103,13 @@ class LedgerStore:
         return list(self.products.values())
 
     def get_customer_credit(self, customer_ref: str) -> Decimal:
+        cleaned = customer_ref.strip()
+        if not cleaned:
+            raise ValueError("customer_ref must not be blank.")
         with self._lock:
             row = self._conn.execute(
                 "SELECT balance_usd FROM customer_credits WHERE customer_ref = ?",
-                (customer_ref.strip(),),
+                (cleaned,),
             ).fetchone()
             return money(row["balance_usd"]) if row else Decimal("0.00")
 
@@ -123,14 +126,19 @@ class LedgerStore:
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
-                for row in reader:
-                    sku = row["sku"].strip().upper()
-                    name = row["name"].strip()
+                for line_no, row in enumerate(reader, start=2):
+                    if any(row.get(col) is None for col in required):
+                        raise ValueError(f"Malformed CSV row {line_no}: missing required column values.")
+                    sku = (row["sku"] or "").strip().upper()
+                    name = (row["name"] or "").strip()
                     if not sku or not name:
-                        raise ValueError("SKU and product name must be non-empty.")
-                    cost = money(row["unit_cost_usd"].strip())
-                    price = money(row["sale_price_usd"].strip())
-                    stock = int(row["stock"].strip())
+                        raise ValueError(f"CSV row {line_no}: SKU and product name must be non-empty.")
+                    cost = money((row["unit_cost_usd"] or "").strip())
+                    price = money((row["sale_price_usd"] or "").strip())
+                    try:
+                        stock = int((row["stock"] or "").strip())
+                    except ValueError as exc:
+                        raise ValueError(f"CSV row {line_no}: invalid integer stock for {sku}.") from exc
                     if cost < Decimal("0.00") or price < cost:
                         raise ValueError(
                             f"Invalid pricing invariant for {sku}: price ({price}) < cost ({cost})"
@@ -163,7 +171,8 @@ class LedgerStore:
                 total_skus = int(self._conn.execute("SELECT COUNT(*) FROM products").fetchone()[0])
                 self._conn.execute("COMMIT")
             except Exception:
-                self._conn.execute("ROLLBACK")
+                if self._conn.in_transaction:
+                    self._conn.execute("ROLLBACK")
                 raise
 
         return {"created": created, "updated": updated, "total_skus": total_skus}
@@ -172,8 +181,9 @@ class LedgerStore:
         """Execute an atomic multi-currency checkout with BEGIN IMMEDIATE stock locking."""
         rate_snapshot = self.exchange_rate_ves
         now = _utc_now_iso()
+        customer_ref = payload.customer_ref.strip()
 
-        # Aggregate quantities per SKU first so split lines for the same SKU cannot bypass stock checks
+        # Aggregate quantities per SKU first so duplicate lines cannot bypass stock checks
         requested_by_sku: Dict[str, int] = defaultdict(int)
         for item in payload.items:
             requested_by_sku[item.sku.strip().upper()] += item.qty
@@ -206,18 +216,25 @@ class LedgerStore:
                     locked_rows[sku] = prod
                     total_usd = money(total_usd + (prod.sale_price_usd * qty))
 
-                # 2. Reconcile multi-currency split payments in USD equivalent
-                paid_usd_equiv = Decimal("0.00")
+                # 2. Aggregate tender by currency BEFORE conversion (prevents split-rounding pumping)
+                total_ves_tender = Decimal("0.00")
+                total_direct_usd = Decimal("0.00")
                 serialized_payments = []
                 for p in payload.payments:
+                    amt = money(p.amount)
                     if p.method == PaymentMethod.VES_PAGO_MOVIL:
-                        usd_eq = money(p.amount / rate_snapshot)
+                        total_ves_tender = money(total_ves_tender + amt)
                     else:
-                        usd_eq = money(p.amount)
-                    paid_usd_equiv = money(paid_usd_equiv + usd_eq)
-                    serialized_payments.append(
-                        {"method": p.method.value, "amount": str(money(p.amount)), "usd_equiv": str(usd_eq)}
-                    )
+                        total_direct_usd = money(total_direct_usd + amt)
+                    serialized_payments.append({"method": p.method.value, "amount": str(amt)})
+
+                # Convert aggregated VES once using ROUND_DOWN so fractional centavos never mint free credit
+                ves_usd_equiv = (
+                    money(total_ves_tender / rate_snapshot, rounding=ROUND_DOWN)
+                    if total_ves_tender > Decimal("0.00")
+                    else Decimal("0.00")
+                )
+                paid_usd_equiv = money(total_direct_usd + ves_usd_equiv)
 
                 diff = money(paid_usd_equiv - total_usd)
                 if diff < Decimal("0.00"):
@@ -250,7 +267,7 @@ class LedgerStore:
                     """,
                     (
                         invoice_id,
-                        payload.customer_ref.strip(),
+                        customer_ref,
                         str(rate_snapshot),
                         str(total_usd),
                         str(paid_usd_equiv),
@@ -265,7 +282,7 @@ class LedgerStore:
                 if diff > Decimal("0.00"):
                     cur_credit_row = self._conn.execute(
                         "SELECT balance_usd FROM customer_credits WHERE customer_ref = ?",
-                        (payload.customer_ref.strip(),),
+                        (customer_ref,),
                     ).fetchone()
                     current_bal = money(cur_credit_row["balance_usd"]) if cur_credit_row else Decimal("0.00")
                     new_bal = money(current_bal + diff)
@@ -277,17 +294,18 @@ class LedgerStore:
                             balance_usd = excluded.balance_usd,
                             updated_at = excluded.updated_at
                         """,
-                        (payload.customer_ref.strip(), str(new_bal), now),
+                        (customer_ref, str(new_bal), now),
                     )
 
                 self._conn.execute("COMMIT")
             except Exception:
-                self._conn.execute("ROLLBACK")
+                if self._conn.in_transaction:
+                    self._conn.execute("ROLLBACK")
                 raise
 
         return {
             "invoice_id": invoice_id,
-            "customer_ref": payload.customer_ref.strip(),
+            "customer_ref": customer_ref,
             "rate_snapshot_ves": str(rate_snapshot),
             "total_usd": str(total_usd),
             "paid_usd_equiv": str(paid_usd_equiv),

@@ -40,7 +40,7 @@ Dockerfile
 ### Local (Python 3.11+)
 ```bash
 pip install -r requirements.txt
-pytest -v
+PYTHONPATH=. pytest -v
 
 POS_DB_PATH=./data/ledger.db POS_OWNER_API_KEY=owner-secret POS_SELLER_API_KEY=seller-secret \
   uvicorn app.main:app --reload
