@@ -1,204 +1,171 @@
 # -*- coding: utf-8 -*-
-"""
-Multi-Currency POS Ledger & Role-Isolated Catalog API (Demo)
-Author: Víctor Yohan Betancourt Marín (https://quanticosystems.com)
-
-Clean-room reference implementation showcasing:
-1. Exact Decimal arithmetic across split multi-currency payments (USD Cash, VES Mobile Payment, USDT).
-2. Exchange-rate snapshot immutability per invoice/delivery note.
-3. Strict API schema boundary: Seller endpoints NEVER serialize unit costs or profit margins.
-4. Idempotent catalog import from CSV/ERP exports without stock corruption.
-"""
+"""FastAPI application factory for the Multi-Currency POS Ledger API."""
 
 from __future__ import annotations
 
-import csv
-import io
-from dataclasses import dataclass, field
-from decimal import Decimal, ROUND_HALF_UP
-from enum import Enum
-from typing import Dict, List
+import os
+from decimal import Decimal
+from pathlib import Path
+from typing import List, Optional
+
 from fastapi import FastAPI, Header, HTTPException
-from pydantic import BaseModel, Field
 
+from app.auth import ApiKeyAuth
+from app.models import (
+    CheckoutIn,
+    CsvImportIn,
+    CustomerCreditOut,
+    PaymentMethod,
+    PaymentSplitIn,
+    ProductOwnerOut,
+    ProductRecord,
+    ProductSellerOut,
+    SaleItemIn,
+    UserRole,
+    money,
+)
+from app.store import LedgerStore
 
-TWOPLACES = Decimal("0.01")
-
-
-def money(val: Decimal | str | int) -> Decimal:
-    if isinstance(val, float):
-        raise TypeError("Floats are forbidden for monetary calculations; use Decimal or str.")
-    return Decimal(val).quantize(TWOPLACES, rounding=ROUND_HALF_UP)
-
-
-class PaymentMethod(str, Enum):
-    USD_CASH = "USD_CASH"
-    VES_PAGO_MOVIL = "VES_PAGO_MOVIL"
-    USDT_BINANCE = "USDT_BINANCE"
-
-
-class UserRole(str, Enum):
-    SELLER = "SELLER"
-    OWNER = "OWNER"
-
-
-@dataclass
-class ProductRecord:
-    sku: str
-    name: str
-    unit_cost_usd: Decimal
-    sale_price_usd: Decimal
-    stock: int
-
-
-class ProductSellerOut(BaseModel):
-    """Public/Seller schema: unit_cost_usd and profit_usd do NOT exist here by design."""
-    sku: str
-    name: str
-    sale_price_usd: Decimal
-    sale_price_ves: Decimal
-    stock: int
-
-
-class ProductOwnerOut(ProductSellerOut):
-    unit_cost_usd: Decimal
-    gross_margin_usd: Decimal
-
-
-class PaymentSplitIn(BaseModel):
-    method: PaymentMethod
-    amount: Decimal = Field(..., gt=Decimal("0"))
-
-
-class SaleItemIn(BaseModel):
-    sku: str
-    qty: int = Field(..., gt=0)
-
-
-class CheckoutIn(BaseModel):
-    customer_ref: str
-    items: List[SaleItemIn] = Field(..., min_length=1)
-    payments: List[PaymentSplitIn] = Field(..., min_length=1)
-
-
-@dataclass
-class LedgerStore:
-    exchange_rate_ves: Decimal = Decimal("45.50")
-    products: Dict[str, ProductRecord] = field(default_factory=dict)
-    sales_history: List[dict] = field(default_factory=list)
-
-    def upsert_csv_catalog(self, csv_text: str) -> dict:
-        reader = csv.DictReader(io.StringIO(csv_text.strip()))
-        created, updated = 0, 0
-        for row in reader:
-            sku = row["sku"].strip().upper()
-            name = row["name"].strip()
-            cost = money(row["unit_cost_usd"].strip())
-            price = money(row["sale_price_usd"].strip())
-            stock = int(row["stock"].strip())
-            if cost < Decimal("0") or price < cost:
-                raise ValueError(f"Invalid pricing invariant for {sku}: price ({price}) < cost ({cost})")
-            if sku in self.products:
-                updated += 1
-            else:
-                created += 1
-            self.products[sku] = ProductRecord(
-                sku=sku, name=name, unit_cost_usd=cost, sale_price_usd=price, stock=stock
-            )
-        return {"created": created, "updated": updated, "total_skus": len(self.products)}
-
-    def checkout(self, payload: CheckoutIn) -> dict:
-        rate_snapshot = self.exchange_rate_ves
-        total_usd = Decimal("0.00")
-
-        # 1. Validate stock before mutating anything
-        for item in payload.items:
-            sku = item.sku.upper()
-            if sku not in self.products:
-                raise KeyError(f"SKU not found: {sku}")
-            prod = self.products[sku]
-            if prod.stock < item.qty:
-                raise ValueError(f"Insufficient stock for {sku}: requested {item.qty}, available {prod.stock}")
-            total_usd = money(total_usd + (prod.sale_price_usd * item.qty))
-
-        # 2. Reconcile multi-currency split payments in USD equivalent
-        paid_usd_equiv = Decimal("0.00")
-        for p in payload.payments:
-            if p.method == PaymentMethod.VES_PAGO_MOVIL:
-                usd_eq = money(p.amount / rate_snapshot)
-            else:
-                usd_eq = money(p.amount)
-            paid_usd_equiv = money(paid_usd_equiv + usd_eq)
-
-        diff = money(paid_usd_equiv - total_usd)
-        if diff < Decimal("0.00"):
-            raise ValueError(f"Underpaid invoice: missing USD {abs(diff)}")
-
-        # 3. Commit stock decrement & immutable receipt with credit balance if overpaid
-        for item in payload.items:
-            self.products[item.sku.upper()].stock -= item.qty
-
-        receipt = {
-            "invoice_id": f"INV-{len(self.sales_history) + 1:04d}",
-            "customer_ref": payload.customer_ref,
-            "rate_snapshot_ves": str(rate_snapshot),
-            "total_usd": str(total_usd),
-            "paid_usd_equiv": str(paid_usd_equiv),
-            "credit_balance_usd": str(diff),
-        }
-        self.sales_history.append(receipt)
-        return receipt
-
-
-store = LedgerStore()
-store.upsert_csv_catalog(
+DEFAULT_DEMO_CATALOG_CSV = (
     "sku,name,unit_cost_usd,sale_price_usd,stock\n"
     "ZAP-101,Calzado Casual Cuero T41,22.00,39.90,12\n"
     "ZAP-102,Deportivo Running T42,26.50,48.00,8\n"
 )
 
-app = FastAPI(title="Multi-Currency POS & Role-Safe Catalog API", version="1.0.0")
+__all__ = [
+    "app",
+    "create_app",
+    "store",
+    "ApiKeyAuth",
+    "CheckoutIn",
+    "CsvImportIn",
+    "CustomerCreditOut",
+    "LedgerStore",
+    "PaymentMethod",
+    "PaymentSplitIn",
+    "ProductOwnerOut",
+    "ProductRecord",
+    "ProductSellerOut",
+    "SaleItemIn",
+    "UserRole",
+    "money",
+]
 
 
-@app.get("/catalog", response_model=List[ProductSellerOut])
-def list_seller_catalog() -> List[ProductSellerOut]:
-    rate = store.exchange_rate_ves
-    return [
-        ProductSellerOut(
-            sku=p.sku,
-            name=p.name,
-            sale_price_usd=p.sale_price_usd,
-            sale_price_ves=money(p.sale_price_usd * rate),
-            stock=p.stock,
-        )
-        for p in store.products.values()
-    ]
+def create_app(
+    *,
+    db_path: str | Path | None = None,
+    exchange_rate_ves: Decimal | None = None,
+    owner_api_key: str | None = None,
+    seller_api_key: str | None = None,
+    seed_demo: bool = True,
+) -> FastAPI:
+    resolved_db = db_path if db_path is not None else os.getenv("POS_DB_PATH", ":memory:")
+    resolved_rate = (
+        exchange_rate_ves
+        if exchange_rate_ves is not None
+        else Decimal(os.getenv("EXCHANGE_RATE_VES", "45.50"))
+    )
+    resolved_owner_key = (
+        owner_api_key if owner_api_key is not None else os.getenv("POS_OWNER_API_KEY", "demo-owner-key")
+    )
+    resolved_seller_key = (
+        seller_api_key if seller_api_key is not None else os.getenv("POS_SELLER_API_KEY", "demo-seller-key")
+    )
+
+    ledger = LedgerStore(exchange_rate_ves=resolved_rate, db_path=resolved_db)
+    auth = ApiKeyAuth(owner_key=resolved_owner_key, seller_key=resolved_seller_key)
+
+    if seed_demo and not ledger.list_products():
+        ledger.upsert_csv_catalog(DEFAULT_DEMO_CATALOG_CSV)
+
+    api = FastAPI(
+        title="Multi-Currency POS Ledger API",
+        version="1.1.0",
+        description=(
+            "FastAPI multi-currency POS engine with atomic SQLite WAL transactions, "
+            "Decimal money arithmetic, API-key RBAC margin isolation, and idempotent CSV import."
+        ),
+    )
+    api.state.store = ledger
+    api.state.auth = auth
+
+    @api.get("/health")
+    def health() -> dict:
+        return {
+            "status": "ok",
+            "exchange_rate_ves": str(ledger.exchange_rate_ves),
+            "skus": len(ledger.list_products()),
+        }
+
+    @api.get("/catalog", response_model=List[ProductSellerOut])
+    def list_seller_catalog() -> List[ProductSellerOut]:
+        rate = ledger.exchange_rate_ves
+        return [
+            ProductSellerOut(
+                sku=p.sku,
+                name=p.name,
+                sale_price_usd=p.sale_price_usd,
+                sale_price_ves=money(p.sale_price_usd * rate),
+                stock=p.stock,
+            )
+            for p in ledger.list_products()
+        ]
+
+    @api.get("/admin/margins", response_model=List[ProductOwnerOut])
+    def list_owner_margins(
+        x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
+    ) -> List[ProductOwnerOut]:
+        auth.require_owner(x_api_key)
+        rate = ledger.exchange_rate_ves
+        return [
+            ProductOwnerOut(
+                sku=p.sku,
+                name=p.name,
+                sale_price_usd=p.sale_price_usd,
+                sale_price_ves=money(p.sale_price_usd * rate),
+                stock=p.stock,
+                unit_cost_usd=p.unit_cost_usd,
+                gross_margin_usd=money(p.sale_price_usd - p.unit_cost_usd),
+            )
+            for p in ledger.list_products()
+        ]
+
+    @api.post("/admin/catalog/import")
+    def import_csv_catalog(
+        body: CsvImportIn,
+        x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
+    ) -> dict:
+        auth.require_owner(x_api_key)
+        try:
+            return ledger.upsert_csv_catalog(body.csv_text)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @api.post("/sales/checkout")
+    def process_checkout(
+        payload: CheckoutIn,
+        x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
+    ) -> dict:
+        auth.resolve_role(x_api_key)
+        try:
+            return ledger.checkout(payload)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @api.get("/customers/{customer_ref}/credit", response_model=CustomerCreditOut)
+    def get_customer_credit(
+        customer_ref: str,
+        x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
+    ) -> CustomerCreditOut:
+        auth.resolve_role(x_api_key)
+        bal = ledger.get_customer_credit(customer_ref)
+        return CustomerCreditOut(customer_ref=customer_ref, credit_balance_usd=str(bal))
+
+    return api
 
 
-@app.get("/admin/margins", response_model=List[ProductOwnerOut])
-def list_owner_margins(x_role: UserRole = Header(...)) -> List[ProductOwnerOut]:
-    if x_role != UserRole.OWNER:
-        raise HTTPException(status_code=403, detail="Profit and cost margins are restricted to OWNER role.")
-    rate = store.exchange_rate_ves
-    return [
-        ProductOwnerOut(
-            sku=p.sku,
-            name=p.name,
-            sale_price_usd=p.sale_price_usd,
-            sale_price_ves=money(p.sale_price_usd * rate),
-            stock=p.stock,
-            unit_cost_usd=p.unit_cost_usd,
-            gross_margin_usd=money(p.sale_price_usd - p.unit_cost_usd),
-        )
-        for p in store.products.values()
-    ]
-
-
-@app.post("/sales/checkout")
-def process_checkout(payload: CheckoutIn) -> dict:
-    try:
-        return store.checkout(payload)
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+app = create_app()
+store: LedgerStore = app.state.store
